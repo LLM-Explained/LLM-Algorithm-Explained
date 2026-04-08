@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass
+from typing import List, Tuple
+
+
+random.seed(0)
+
+
+# ------------------------------------------------------------
+# Simplified OAPL backbone demo
+# ------------------------------------------------------------
+# This demo implements the core algorithmic structure:
+#   1) a lagged inference policy generates rollouts
+#   2) a trainable policy is updated from those off-policy rollouts
+#   3) the update includes a KL-style anchor to the lagged inference policy
+#
+# The environment is a binary-action bandit:
+#   action 1 is usually better than action 0
+#
+# The point is not the task.
+# The point is to show the OAPL-style update rule itself.
+# ------------------------------------------------------------
+
+
+@dataclass
+class Policy:
+    """
+    Bernoulli policy over one binary action.
+    p_good = P(action = 1)
+    """
+    p_good: float
+
+    def sample(self, n: int) -> List[int]:
+        return [1 if random.random() < self.p_good else 0 for _ in range(n)]
+
+    def logprob(self, action: int) -> float:
+        p = min(max(self.p_good, 1e-6), 1 - 1e-6)
+        return math.log(p if action == 1 else (1 - p))
+
+
+def reward(action: int) -> float:
+    """
+    Simple stochastic reward model:
+    action 1 is better on average.
+    """
+    base = 1.0 if action == 1 else 0.2
+    noise = random.uniform(-0.05, 0.05)
+    return base + noise
+
+
+def kl_bernoulli(p: float, q: float) -> float:
+    """
+    KL(Bern(p) || Bern(q))
+    """
+    eps = 1e-6
+    p = min(max(p, eps), 1 - eps)
+    q = min(max(q, eps), 1 - eps)
+    return p * math.log(p / q) + (1 - p) * math.log((1 - p) / (1 - q))
+
+
+def estimate_advantages(rollouts: List[Tuple[int, float]]) -> List[float]:
+    rewards = [r for _, r in rollouts]
+    baseline = sum(rewards) / len(rewards)
+    return [r - baseline for _, r in rollouts]
+
+
+def collect_rollouts(inference_policy: Policy, n: int) -> List[Tuple[int, float]]:
+    actions = inference_policy.sample(n)
+    return [(a, reward(a)) for a in actions]
+
+
+def oapl_update(
+    training_policy: Policy,
+    inference_policy: Policy,
+    rollouts: List[Tuple[int, float]],
+    lr: float = 0.1,
+    tau: float = 0.5,
+) -> Tuple[float, float]:
+    """
+    Simplified OAPL-style update:
+
+    maximize expected advantage under off-policy rollouts,
+    while regularizing with a KL anchor toward the lagged inference policy.
+
+    For a Bernoulli policy, we update p_good directly using a finite-difference
+    estimate of the objective gradient.
+    """
+    advantages = estimate_advantages(rollouts)
+
+    def objective(p_good: float) -> float:
+        p_good = min(max(p_good, 1e-4), 1 - 1e-4)
+        tmp_policy = Policy(p_good=p_good)
+
+        policy_term = 0.0
+        for (action, _), adv in zip(rollouts, advantages):
+            policy_term += adv * tmp_policy.logprob(action)
+        policy_term /= len(rollouts)
+
+        kl_term = kl_bernoulli(tmp_policy.p_good, inference_policy.p_good)
+        return policy_term - tau * kl_term
+
+    p = training_policy.p_good
+    eps = 1e-3
+    grad = (objective(p + eps) - objective(p - eps)) / (2 * eps)
+
+    training_policy.p_good = min(
+        max(training_policy.p_good + lr * grad, 0.01), 0.99)
+
+    return objective(training_policy.p_good), grad
+
+
+def evaluate(policy: Policy, n: int = 1000) -> float:
+    rs = [reward(a) for a in policy.sample(n)]
+    return sum(rs) / len(rs)
+
+
+def main():
+    inference_policy = Policy(p_good=0.55)  # lagged rollout policy
+    training_policy = Policy(p_good=0.55)   # trainable policy
+
+    print("=== OAPL backbone demo ===\n")
+    print(f"initial inference policy p_good : {inference_policy.p_good:.3f}")
+    print(f"initial training  policy p_good : {training_policy.p_good:.3f}\n")
+
+    for step in range(12):
+        rollouts = collect_rollouts(inference_policy, n=128)
+
+        obj, grad = oapl_update(
+            training_policy=training_policy,
+            inference_policy=inference_policy,
+            rollouts=rollouts,
+            lr=0.25,
+            tau=0.8,
+        )
+
+        # simulate lagged synchronization:
+        # inference policy updates more slowly than training policy
+        if step % 3 == 0:
+            inference_policy.p_good = 0.8 * \
+                inference_policy.p_good + 0.2 * training_policy.p_good
+
+        train_reward = evaluate(training_policy, n=300)
+        infer_reward = evaluate(inference_policy, n=300)
+
+        print(
+            f"step={step:02d}  "
+            f"obj={obj:.4f}  "
+            f"grad={grad:+.4f}  "
+            f"train_p={training_policy.p_good:.3f}  "
+            f"infer_p={inference_policy.p_good:.3f}  "
+            f"train_reward={train_reward:.3f}  "
+            f"infer_reward={infer_reward:.3f}"
+        )
+
+    print("\nInterpretation:")
+    print("- Rollouts are generated by a lagged inference policy, not the current training policy.")
+    print("- The training policy is updated off-policy using those rollouts.")
+    print("- A KL-style anchor keeps the updated policy from drifting too far from the inference policy.")
+    print("- This is the core algorithmic backbone behind OAPL.")
+
+
+if __name__ == "__main__":
+    main()
